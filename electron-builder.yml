@@ -8,6 +8,7 @@ directories:
 
 files:
   - build/**/*
+  - scripts/preload.js
   - scripts/web/**/*
   - env/**/*
   - package.json

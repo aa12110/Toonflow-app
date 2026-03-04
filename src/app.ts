@@ -13,8 +13,11 @@ import jwt from "jsonwebtoken";
 
 const app = express();
 let server: ReturnType<typeof app.listen> | null = null;
+let appInitialized = false;
 
-export default async function startServe(randomPort: Boolean = false) {
+async function initApp(): Promise<void> {
+  if (appInitialized) return;
+
   if (process.env.NODE_ENV == "dev") await buildRoute();
 
   expressWs(app);
@@ -77,14 +80,67 @@ export default async function startServe(randomPort: Boolean = false) {
     res.status(err.status || 500).send(err);
   });
 
-  const port = randomPort ? 0 : parseInt(process.env.PORT || "60000");
-  return await new Promise((resolve, reject) => {
-    server = app.listen(port, async (v) => {
-      const address = server?.address();
-      const realPort = typeof address === "string" ? address : address?.port;
+  appInitialized = true;
+}
+
+export default async function startServe(randomPort: boolean = false): Promise<number> {
+  await initApp();
+
+  const configuredPort = Number.parseInt(process.env.PORT || "60000", 10);
+  const defaultPort = Number.isNaN(configuredPort) ? 60000 : configuredPort;
+  const port = randomPort ? 0 : defaultPort;
+
+  return await new Promise<number>((resolve, reject) => {
+    let settled = false;
+    let nextServer: ReturnType<typeof app.listen> | null = null;
+
+    const cleanup = () => {
+      if (!nextServer) return;
+      nextServer.removeListener("error", onError);
+      nextServer.removeListener("listening", onListening);
+    };
+
+    const safeReject = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (server === nextServer) server = null;
+      reject(err);
+    };
+
+    const onError = (err: Error) => {
+      safeReject(err);
+    };
+
+    const onListening = () => {
+      if (!nextServer) {
+        safeReject(new Error("服务启动对象不存在"));
+        return;
+      }
+
+      const address = nextServer.address();
+      const realPort = typeof address === "string" ? defaultPort : address?.port;
+
+      if (typeof realPort !== "number" || Number.isNaN(realPort)) {
+        safeReject(new Error("无法获取服务监听端口"));
+        return;
+      }
+
+      if (settled) return;
+      settled = true;
+      cleanup();
       console.log(`[服务启动成功]: http://localhost:${realPort}`);
       resolve(realPort);
-    });
+    };
+
+    try {
+      nextServer = app.listen(port);
+      server = nextServer;
+      nextServer.once("error", onError);
+      nextServer.once("listening", onListening);
+    } catch (err) {
+      safeReject(err instanceof Error ? err : new Error(String(err)));
+    }
   });
 }
 
@@ -93,7 +149,14 @@ export function closeServe(): Promise<void> {
   return new Promise((resolve, reject) => {
     if (server) {
       server.close((err?: Error) => {
-        if (err) return reject(err);
+        if (err) {
+          const serverError = err as NodeJS.ErrnoException;
+          if (serverError.code !== "ERR_SERVER_NOT_RUNNING") {
+            return reject(err);
+          }
+        }
+
+        server = null;
         console.log("[服务已关闭]");
         resolve();
       });
@@ -104,4 +167,8 @@ export function closeServe(): Promise<void> {
 }
 
 const isElectron = typeof process.versions?.electron !== "undefined";
-if (!isElectron) startServe();
+if (!isElectron) {
+  void startServe().catch((err) => {
+    console.error("[服务启动失败]:", err);
+  });
+}

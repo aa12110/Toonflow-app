@@ -1,46 +1,106 @@
-import { app, BrowserWindow } from "electron";
+import { app, BrowserWindow, ipcMain } from "electron";
+import net from "net";
 import path from "path";
 import startServe, { closeServe } from "src/app";
-import { number } from "zod";
 
 // 默认端口配置
 const defaultPort = 60000;
 
-function createMainWindow(port: any): void {
+type BackendRuntimeConfig = {
+  baseUrl: string;
+  wsBaseUrl: string;
+};
+
+const toBackendRuntimeConfig = (port: number): BackendRuntimeConfig => ({
+  baseUrl: `http://localhost:${port}`,
+  wsBaseUrl: `ws://localhost:${port}`,
+});
+
+let backendRuntimeConfig: BackendRuntimeConfig = toBackendRuntimeConfig(defaultPort);
+
+const getIsDev = (): boolean => process.env.NODE_ENV === "dev" || !app.isPackaged;
+
+const getHtmlPath = (): string => {
+  if (getIsDev()) {
+    return path.join(process.cwd(), "scripts", "web", "index.html");
+  }
+  return path.join(app.getAppPath(), "scripts", "web", "index.html");
+};
+
+const getPreloadPath = (): string => {
+  if (getIsDev()) {
+    return path.join(process.cwd(), "scripts", "preload.js");
+  }
+  return path.join(app.getAppPath(), "scripts", "preload.js");
+};
+
+const isPortOccupied = async (port: number): Promise<boolean> => {
+  return await new Promise((resolve) => {
+    const tester = net.createServer();
+
+    tester.once("error", () => {
+      resolve(true);
+    });
+
+    tester.once("listening", () => {
+      tester.close(() => resolve(false));
+    });
+
+    tester.listen(port);
+  });
+};
+
+function createMainWindow(config: BackendRuntimeConfig): void {
   const win = new BrowserWindow({
     width: 900,
     height: 600,
     show: true,
     autoHideMenuBar: true,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      preload: getPreloadPath(),
+    },
   });
-  // 开发环境和生产环境使用不同的路径
-  const isDev = process.env.NODE_ENV === "dev" || !app.isPackaged;
-  const htmlPath = isDev
-    ? path.join(process.cwd(), "scripts", "web", "index.html")
-    : path.join(app.getAppPath(), "scripts", "web", "index.html");
-  
-  // 使用实际端口构建地址
-  const baseUrl = `http://localhost:${port}`;
-  const wsBaseUrl = `ws://localhost:${port}`;
-  
-  // 构建带有 query 参数的 URL
+
+  const htmlPath = getHtmlPath();
   const url = new URL(`file://${htmlPath}`);
-  url.searchParams.set("baseUrl", baseUrl);
-  url.searchParams.set("wsBaseUrl", wsBaseUrl);
-  
-  console.log("%c Line:30 🥓 url", "background:#33a5ff", url.toString());
+  // 保留 query 兜底兼容，主通道改为 preload + contextIsolation
+  url.searchParams.set("baseUrl", config.baseUrl);
+  url.searchParams.set("wsBaseUrl", config.wsBaseUrl);
 
   void win.loadURL(url.toString());
 }
-app.whenReady().then(async () => {
+
+const startBackendWithFallback = async (): Promise<BackendRuntimeConfig> => {
+  const occupied = await isPortOccupied(defaultPort);
+  if (occupied) {
+    console.warn(`[固定端口 ${defaultPort} 已占用，回退随机端口]`);
+    const randomPort = await startServe(true);
+    return toBackendRuntimeConfig(randomPort);
+  }
+
   try {
-    const port = await startServe(false);
-    createMainWindow(60000);
+    const fixedPort = await startServe(false);
+    return toBackendRuntimeConfig(fixedPort);
+  } catch (fixedPortError) {
+    console.warn("[固定端口启动失败，回退随机端口]:", fixedPortError);
+    const randomPort = await startServe(true);
+    return toBackendRuntimeConfig(randomPort);
+  }
+};
+
+app.whenReady().then(async () => {
+  ipcMain.handle("app:get-backend-config", async () => ({ ...backendRuntimeConfig }));
+
+  try {
+    backendRuntimeConfig = await startBackendWithFallback();
   } catch (err) {
     console.error("[服务启动失败]:", err);
-    // 如果服务启动失败，使用默认端口创建窗口
-    createMainWindow(defaultPort);
+    backendRuntimeConfig = toBackendRuntimeConfig(defaultPort);
   }
+
+  createMainWindow(backendRuntimeConfig);
 });
 
 app.on("window-all-closed", () => {
@@ -49,11 +109,15 @@ app.on("window-all-closed", () => {
 
 app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length === 0) {
-    // 重新激活时使用默认端口
-    createMainWindow(defaultPort);
+    createMainWindow(backendRuntimeConfig);
   }
 });
 
-app.on("before-quit", async (event) => {
-  await closeServe();
+app.on("before-quit", async () => {
+  ipcMain.removeHandler("app:get-backend-config");
+  try {
+    await closeServe();
+  } catch (err) {
+    console.warn("[服务关闭失败]:", err);
+  }
 });
